@@ -17,9 +17,9 @@ import { readFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { walkDir } from "../ingest/fs.js";
 import { contextDirFor, ensureGitignored, ensureSearchable } from "../context/node-file.js";
-import { extractFile, languageLabelOf, languageOf, type RawEdge } from "./extract.js";
-import { extractGeneric, genericLangOf, warmGenericGrammars } from "./generic.js";
-import { containerLangOf, extractContainer, warmContainerGrammars } from "./container.js";
+import { languageLabelOf, type RawEdge } from "./extract.js";
+import { genericLangOf, warmGenericGrammars } from "./generic.js";
+import { containerLangOf, warmContainerGrammars } from "./container.js";
 import { contentHash } from "../util/id.js";
 import { relPosix } from "../util/paths.js";
 import { readSourceFile } from "../util/source.js";
@@ -33,8 +33,10 @@ import {
 import { writeFingerprint } from "./fingerprint.js";
 import { seedGraph, type SeedResult } from "./seed.js";
 import { filterByOnlyDirs, listSourceStats } from "./source-files.js";
+import { extractOne, type ExtractOneResult } from "./extract-one.js";
+import type { SourceStat } from "./source-files.js";
 import { resolveEdges, type GoModule } from "./resolve.js";
-import { enrichGraph, type EnrichStats } from "./enrich.js";
+import { enrichGraph, type EnrichStats, type SourceLookup } from "./enrich.js";
 import { readGraph, writeGraph, wiringPath } from "./write.js";
 import { writeCards, writeIndex, writeCovers, type CardStats } from "./cards.js";
 import { writeAskIndex } from "../ask/index-file.js";
@@ -168,7 +170,6 @@ export async function buildGraph(
 
   const nodes: NodeV1[] = [];
   const rawEdges: RawEdge[] = [];
-  const sources = new Map<string, string>();
   /** Display labels, not grammars — `.mjs` is parsed as typescript but reported as
    * javascript, or the banner claims a repo's JavaScript went unindexed. */
   const langs = new Set<string>();
@@ -202,84 +203,47 @@ export async function buildGraph(
     new Set(files.map((f) => containerLangOf(f.abs)?.name).filter((n): n is string => !!n)),
   );
 
-  files.forEach((f, i) => {
+  const labelOf = (abs: string): string => languageLabelOf(abs) ?? containerLangOf(abs)?.name ?? genericLangOf(abs)?.name ?? "unknown";
+  const applyResult = (f: SourceStat, r: ExtractOneResult): void => {
     const rel = f.rel;
-    opts.onProgress?.({ phase: "parse", index: i, total: files.length, file: rel });
-    // Depth tier (hand-written, native grammar) if a language claims the file;
-    // otherwise the breadth tier (generic tags.scm over a WASM grammar).
-    const lang = languageOf(f.abs);
-    // A container is neither tier: its wrapper grammar only locates the embedded
-    // block, which then goes to the depth-tier extractor. Checked before the
-    // breadth tier so a future grammar claiming .vue can't shadow it.
-    const container = lang ? null : containerLangOf(f.abs);
-    const generic = lang || container ? null : genericLangOf(f.abs);
-    const label = languageLabelOf(f.abs) ?? container?.name ?? generic?.name ?? "unknown";
-    const cached = priorExtract.files[rel];
+    switch (r.kind) {
+      case "reused": {
+        const cached = priorExtract.files[rel]!; // reused is only reported against a hash we supplied
+        entries[rel] = { ...cached, size: f.size, mtimeMs: f.mtimeMs };
+        reused++;
+        nodes.push(...cached.nodes);
+        rawEdges.push(...cached.rawEdges);
+        langs.add(labelOf(f.abs));
+        return;
+      }
+      case "skipped":
+        entries[rel] = r.entry;
+        if (r.entry.error) errors.push(r.entry.error);
+        return;
+      case "parsed":
+        parsed++;
+        entries[rel] = r.entry;
+        nodes.push(...r.entry.nodes);
+        rawEdges.push(...r.entry.rawEdges);
+        langs.add(r.label);
+        return;
+      case "error":
+        parsed++;
+        entries[rel] = r.entry;
+        errors.push(r.message);
+        return;
+    }
+  };
+  // A cached FAILURE is never offered for reuse (PR 1): its hash is withheld so
+  // extractOne parses the file again.
+  const cachedHashOf = (rel: string): string | null => {
+    const c = priorExtract.files[rel];
+    return c && !c.error ? c.hash : null;
+  };
 
-    // Every file is read and hashed, every build — only the *parse* is memoized.
-    // The tempting optimization is to trust the probe's `(size, mtimeMs)` and skip
-    // the read too, but then `graft build` inherits the probe's blind spot: on a
-    // filesystem with coarse mtime granularity, a same-length edit inside the same
-    // second is invisible, so `graft check` reports drift (it always re-hashes) and
-    // the `graft build` it tells you to run refuses to repair it — forever. A stat
-    // may decide whether a *query* bothers rebuilding; it may not decide what the
-    // rebuild itself looks at. Reading is ~0.05ms/file against the ~4.6ms parse
-    // this still skips.
-    let source: string | null;
-    try {
-      source = readSourceFile(f.abs);
-    } catch (err) {
-      const message = `${rel}: ${err instanceof Error ? err.message : String(err)}`;
-      errors.push(message);
-      // Record it anyway (with the stat we do have) so the freshness probe's
-      // fast path doesn't report this file as new on every single query.
-      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash: "", nodes: [], rawEdges: [], error: message };
-      return;
-    }
-    if (source === null) {
-      // Unsupported encoding (UTF-16BE) — a skip, never an error: recorded with
-      // an empty entry so the freshness probe doesn't treat it as new every run.
-      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash: "", nodes: [], rawEdges: [] };
-      return;
-    }
-
-    const hash = contentHash(source);
-    // A cached FAILURE is never replayed. Most parse failures are not properties
-    // of the file: a WASM grammar that aborted because the heap was exhausted by
-    // the files before it fails again only if the heap is exhausted again. Replaying
-    // the error would pin it to the file until its bytes changed; on a 65k-file
-    // repo that was 52k files stuck failing after a single abort. Re-parsing a
-    // genuinely broken file costs one parse per build, which is nothing. (The
-    // pre-query refresh never rebuilds solely to retry an errored file:
-    // fingerprint.ts keeps the entry's real hash on its stat fast path. A rebuild
-    // triggered by other drift re-parses it like any build.)
-    if (cached && hash === cached.hash && !cached.error) {
-      entries[rel] = { ...cached, size: f.size, mtimeMs: f.mtimeMs };
-      sources.set(rel, source);
-      reused++;
-      nodes.push(...cached.nodes);
-      rawEdges.push(...cached.rawEdges);
-      langs.add(label);
-      return;
-    }
-
-    parsed++;
-    try {
-      const { nodes: fileNodes, rawEdges: fileEdges } = lang
-        ? extractFile(rel, source, lang)
-        : container
-          ? extractContainer(rel, source, container)
-          : extractGeneric(rel, source, generic!.name);
-      nodes.push(...fileNodes);
-      rawEdges.push(...fileEdges);
-      sources.set(rel, source);
-      langs.add(label);
-      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash, nodes: fileNodes, rawEdges: fileEdges };
-    } catch (err) {
-      const message = `${rel}: parse failed — ${err instanceof Error ? err.message : String(err)}`;
-      errors.push(message);
-      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash, nodes: [], rawEdges: [], error: message };
-    }
+  files.forEach((f, i) => {
+    opts.onProgress?.({ phase: "parse", index: i, total: files.length, file: f.rel });
+    applyResult(f, extractOne(f, cachedHashOf(f.rel)));
   });
 
   // Persist the memo BEFORE enrichment, because `enrichGraph` mutates these very
@@ -320,6 +284,27 @@ export async function buildGraph(
   // Read BEFORE the first checkpoint can overwrite wiring.json.
   const prior = readGraph(wiringPath(outDir));
   const priorById = new Map((prior?.nodes ?? []).map((n) => [n.id, n]));
+  // The meaning pass reads a file only when it summarizes it, and only if the
+  // bytes still hash to what was parsed. Holding every source for the whole build
+  // was ~1 GB of strings on a 65k-file repo, for a pass a Tier-1 build never runs.
+  const absOf = new Map(files.map((f) => [f.rel, f.abs] as const));
+  const sources: SourceLookup = {
+    has: (rel) => {
+      const e = entries[rel];
+      return e !== undefined && e.hash !== "" && !e.error;
+    },
+    get: (rel) => {
+      const abs = absOf.get(rel);
+      const e = entries[rel];
+      if (!abs || !e) return undefined;
+      try {
+        const text = readSourceFile(abs);
+        return text !== null && contentHash(text) === e.hash ? text : undefined;
+      } catch {
+        return undefined;
+      }
+    },
+  };
   const meaning = await enrichGraph(nodes, priorById, sources, {
     summarizer: opts.summarizer,
     concurrency: opts.concurrency,
