@@ -308,6 +308,7 @@ program
   .option("--deep", "run the LLM pass: concept nodes (graft/*.md) + per-symbol summary/crux")
   .option("-e, --extensions <exts...>", 'code extensions to include (e.g. ".ts" ".py"); an extension with no parser is ignored with a warning that lists the supported set')
   .option("-j, --concurrency <n>", "files summarized in parallel during --deep (default 5)")
+  .option("--workers <n>", "parse in <n> child processes for a large cold build (or 'auto'); default in-process. GRAFT_PARSE_WORKERS sets the default")
   .option("--no-reuse", "re-parse every file instead of replaying unchanged ones from the extraction cache")
   .option("--lsp", "add compiler-grade call edges via a language server if one is installed (opt-in, slower; e.g. rust-analyzer, clangd)")
   .option("--allow-partial", "with --deep: exit 0 even when some files' summaries failed (default: a degraded meaning tier exits 1)")
@@ -351,6 +352,7 @@ program
       deep?: boolean;
       extensions?: string[];
       concurrency?: string;
+      workers?: string;
       reuse?: boolean;
       lsp?: boolean;
       allowPartial?: boolean;
@@ -371,6 +373,11 @@ program
       console.error(`✗ --concurrency must be a number, got "${opts.concurrency}"`);
       process.exit(1);
     }
+    // Opt-in only. The env var is read HERE, by the one command a human runs,
+    // never by buildGraph: the pre-query refresh must not fork under a query.
+    const workersArg = (opts.workers as string | undefined) ?? process.env.GRAFT_PARSE_WORKERS;
+    const parseWorkers: number | "auto" | undefined =
+      workersArg === undefined ? undefined : workersArg === "auto" ? "auto" : Number.parseInt(workersArg, 10) || 0;
     warnUnsupportedExtensions(opts.extensions);
     // Persisted BEFORE the build itself runs, so this invocation's walks (and
     // every later no-flag build / hooks refresh) see it identically — the
@@ -492,6 +499,7 @@ program
     const g = await engine.graph(dir, {
       llm: deep,
       concurrency,
+      parseWorkers,
       reuse: opts.reuse,
       lsp: opts.lsp,
       onlyDirs,
@@ -506,6 +514,7 @@ program
     process.stderr.write("\n");
     console.log(`✓ wiring: ${g.nodes} nodes (${fmt(g.byKind)}), ${g.edges} edges, ${g.cards} cards [${g.languages.join(", ")}]`);
     console.log(`  parsed: ${g.parsed} of ${g.files} files (${g.reused} replayed from cache)`);
+    if (g.parseWorkers > 0) console.log(`  workers: ${g.parseWorkers} parser processes`);
     // Worth one line: this build started from a graph the user never built *here*.
     if (g.seededFrom) console.log(`  seeded: copied a starting graph from ${g.seededFrom} (git worktree)`);
     if (deep) {
