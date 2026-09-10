@@ -122,6 +122,26 @@ test("readGraph streaming returns null on a file that is not line-shaped", () =>
   assert.equal(readGraphFromBuffer(Buffer.from("garbage\n")), null);
 });
 
+test("readGraphFromBuffer tolerates a top-level header key other than meta before nodes", () => {
+  // A hand-written header carrying an extra key ahead of "nodes": the reader must
+  // parse the whole header object rather than slice `meta` out by fixed offsets, so
+  // the extra field survives on the result instead of failing the parse.
+  const meta = JSON.stringify(GRAPH.meta);
+  const buf = Buffer.from(`{"meta":${meta},"extra":1,"nodes":[\n],"edges":[\n]}\n`);
+  const g = readGraphFromBuffer(buf);
+  assert.ok(g, "parsed the hand-written header");
+  assert.deepEqual(g!.meta, GRAPH.meta);
+  assert.equal((g as unknown as { extra: number }).extra, 1, "the extra key survives on the result");
+  assert.deepEqual(g!.nodes, []);
+  assert.deepEqual(g!.edges, []);
+});
+
+test("writeGraph refuses a graph carrying a top-level key other than meta/nodes/edges", () => {
+  const d = mkdtempSync(join(tmpdir(), "graft-wiring-guard-"));
+  const rogue = { ...GRAPH, extra: 1 } as unknown as GraphV1;
+  assert.throws(() => writeGraph(rogue, d), /extra/, "the error names the offending key so it can't silently corrupt the head slice");
+});
+
 test("writeAskIndex writes one doc per line, still valid JSON, and streams back identically", () => {
   const d = mkdtempSync(join(tmpdir(), "graft-askidx-lines-"));
   writeAskIndex(d, GRAPH);

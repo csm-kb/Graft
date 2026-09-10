@@ -51,7 +51,7 @@ export function readGraphFromBuffer(buf: Buffer): GraphV1 | null {
   const NODES_OPEN = ',"nodes":[';
   const EDGES_OPEN = '],"edges":[';
   const END = "]}";
-  let meta: GraphV1["meta"] | null = null;
+  let head: Record<string, unknown> | null = null;
   const nodes: NodeV1[] = [];
   const edges: EdgeV1[] = [];
   let target: NodeV1[] | EdgeV1[] | null = null;
@@ -61,8 +61,13 @@ export function readGraphFromBuffer(buf: Buffer): GraphV1 | null {
     if (bad || closed) { if (line !== "") bad = true; return; }
     try {
       if (i === 0) {
+        // Parse the whole header object (as readAskIndexFromBuffer does) rather than
+        // slicing `meta` out by fixed offsets: strip the trailing `,"nodes":[`, close
+        // the object, and JSON.parse it. This tolerates any top-level key that precedes
+        // `nodes` — not just `meta` — so a future header field round-trips instead of
+        // failing a slice that assumed `meta` was the only key before `nodes`.
         if (!line.startsWith('{"meta":') || !line.endsWith(NODES_OPEN)) { bad = true; return; }
-        meta = JSON.parse(line.slice('{"meta":'.length, line.length - NODES_OPEN.length)) as GraphV1["meta"];
+        head = JSON.parse(line.slice(0, -NODES_OPEN.length) + "}") as Record<string, unknown>;
         target = nodes;
         return;
       }
@@ -75,11 +80,24 @@ export function readGraphFromBuffer(buf: Buffer): GraphV1 | null {
       bad = true;
     }
   });
-  if (bad || !closed || meta === null) return null;
-  return { meta, nodes, edges };
+  if (bad || !closed || head === null) return null;
+  const { meta, ...rest } = head as Record<string, unknown>;
+  if (meta === undefined || meta === null) return null;
+  // Spread any other top-level header keys (there are none today) alongside meta so
+  // the reader stays forward-compatible with whatever writeGraph writes next.
+  return { ...rest, meta, nodes, edges } as GraphV1;
 }
 
 export function writeGraph(graph: GraphV1, outDir: string): string {
+  // The `head` slice below assumes the serialized object is exactly
+  // `{...meta...,"nodes":[],"edges":[]}` — meta the only key before `nodes`. A
+  // future top-level key would land between them and silently corrupt that slice,
+  // so refuse it here (naming it) rather than write a broken file.
+  for (const key of Object.keys(graph)) {
+    if (key !== "meta" && key !== "nodes" && key !== "edges") {
+      throw new Error(`writeGraph: unexpected top-level graph key ${JSON.stringify(key)} (only meta, nodes, edges are serialized)`);
+    }
+  }
   const nodes = [...graph.nodes].sort((a, b) => a.id.localeCompare(b.id));
   const edges = [...graph.edges].sort(edgeOrder);
   const path = wiringPath(outDir);

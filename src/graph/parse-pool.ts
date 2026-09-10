@@ -13,7 +13,11 @@
  *   - if no job ever succeeded, the crashes are environmental (fork, loader,
  *     permissions), so the parked jobs are parsed in-thread with the rest.
  * A pool that cannot keep children alive hands the remaining queue back to the
- * parent, which has warmed grammars.
+ * parent, which has warmed grammars. A child that dies before it ever signals
+ * `ready` is a warm-up failure, not a parse failure — in a broken environment
+ * (fork, loader, permissions) each such wave costs a full warm-up timeout with
+ * nothing to show — so it is charged two respawn credits instead of one, and the
+ * pool falls back to in-thread after half as many warm-up waves.
  */
 import { fork, type ChildProcess, type ForkOptions } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -164,6 +168,10 @@ export function runParsePool(
       children.add(child);
       let current: Job | null = null;
       let ready = false;
+      // `onGone` is wired to both `exit` and `error` and is also called directly
+      // when the initial `post(init)` fails; the second firing for the same child
+      // must be a no-op, or a slot would be freed twice.
+      let gone = false;
       let timer: NodeJS.Timeout | null = setTimeout(() => child.kill(), warmTimeoutMs);
       timer.unref();
       const clearTimer = (): void => { if (timer) { clearTimeout(timer); timer = null; } };
@@ -202,6 +210,8 @@ export function runParsePool(
       });
 
       const onGone = (code: number | null, signal: NodeJS.Signals | null): void => {
+        if (gone) return;
+        gone = true;
         clearTimer();
         children.delete(child);
         if (settled) return;
@@ -220,10 +230,13 @@ export function runParsePool(
         }
         if (queue.length === 0) { drainIfIdle(); return; }
         // Work remains. Replace the child within reason; past that, the pool is
-        // not working on this machine and the parent finishes the job itself.
+        // not working on this machine and the parent finishes the job itself. A
+        // death before this child ever signalled `ready` is a warm-up failure, so
+        // charge it a second respawn credit: a pathological environment burns its
+        // budget in half as many warm-up waves before falling back to in-thread.
+        if (!ready) respawns++;
         if (respawns++ < maxRespawns) spawn();
         else if (children.size === 0) fallbackInThread();
-        void ready;
       };
       child.once("exit", onGone);
       child.once("error", () => onGone(null, null)); // spawn failure: no exit follows

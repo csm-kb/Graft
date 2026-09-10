@@ -126,6 +126,11 @@ export function writeAskIndex(outDir: string, graph: GraphV1): string {
   // order matches AskIndex (version, avgBodyLen, df, docCount, docs).
   const w = openAtomic(outPath);
   try {
+    // The header is one line, and the whole `df` array lives on it — the streaming
+    // reader walks a line at a time, so this single line must itself fit under
+    // buffer.constants.MAX_STRING_LENGTH (~512 MB). df is the corpus vocabulary
+    // (one entry per distinct token, not per node), so even at 65k files it is a
+    // few MB — far off the ceiling. Only the per-line docs below scale with nodes.
     w.write(`{"version":1,"avgBodyLen":${JSON.stringify(avgBodyLen)},"df":${JSON.stringify(pairs(df))},"docCount":${nodes.length},"docs":[`);
     docs.forEach((doc, i) => w.write("\n" + JSON.stringify(doc) + (i < docs.length - 1 ? "," : "")));
     w.write("\n]}\n");

@@ -76,10 +76,16 @@ test("a --deep build summarizes from disk without buildGraph holding every sourc
 
 test("a file edited between parse and summary is left pending, not summarized against the wrong lines", async () => {
   const d = repo();
+  // With concurrency 1 the enrich pass visits files in dirty-node order, which is
+  // `listSourceStats` order: src/lib.rs first, then src/math.ts. On the FIRST
+  // describeFile call (src/lib.rs) we edit the file summarized SECOND (src/math.ts)
+  // so its on-disk bytes no longer hash to what was parsed. buildGraph's
+  // SourceLookup.get re-hashes before handing over the source and returns undefined
+  // on a mismatch, so src/math.ts is left pending — never summarized against changed
+  // bytes. Drop that hash check and math.ts goes "ready" here, which is the bug.
   let edited = false;
   const crux: CruxSummarizer = {
     async describeFile(input) {
-      // Simulate an agent editing another file while this one is summarized.
       if (!edited) { edited = true; writeFileSync(join(d, "src", "math.ts"), "export function add(a: number, b: number): number {\n  return a + b + 0;\n}\n"); }
       return input.nodes.map((n) => ({ id: n.id, summary: `crux ${n.id}`, crux_start: 0, crux_end: 0 }));
     },
@@ -87,11 +93,16 @@ test("a file edited between parse and summary is left pending, not summarized ag
   const r = await buildGraph(d, { reuse: false, summarizer: crux, concurrency: 1 });
   assert.equal(r.errors.length, 0, r.errors.join("; "));
   const g = readGraph(wiringPath(contextDirFor(d)))!;
-  const states = new Set(g.nodes.filter((n) => n.path === "src/math.ts" || n.path === "src/lib.rs").map((n) => n.summary_state));
-  // Whichever file was summarized first is ready; the edited one may be pending.
-  // What must never happen is a "ready" summary computed against changed bytes.
-  assert.ok(states.has("ready"));
-  assert.ok(r.meaning.pending + r.meaning.computed >= 1);
+  const first = g.nodes.filter((n) => n.path === "src/lib.rs");
+  const second = g.nodes.filter((n) => n.path === "src/math.ts");
+  assert.ok(first.length > 0, "src/lib.rs contributed nodes");
+  assert.ok(second.length > 0, "src/math.ts contributed nodes");
+  // The first file was summarized against the exact bytes it was parsed from.
+  for (const n of first) assert.equal(n.summary_state, "ready", `${n.id} should be ready`);
+  // The second file changed on disk between parse and summary; every one of its
+  // nodes must be left pending — never a "ready" summary computed against the
+  // wrong lines. This is what fails if the hash check in SourceLookup.get is gone.
+  for (const n of second) assert.notEqual(n.summary_state, "ready", `${n.id} must not be ready against changed bytes`);
 });
 
 import { existsSync } from "node:fs";
@@ -170,7 +181,12 @@ test("runParsePool: children that never become ready are killed at the warm-up t
   const files = listSourceStats(d, join(d, "graft"));
   const t0 = Date.now();
   const results = await runParsePool(files, () => null, { generic: ["rust"], container: [] }, { workers: 2, entry: fakeWorker(d, "never-ready"), warmTimeoutMs: 1500 });
-  assert.ok(Date.now() - t0 < 10_000, "did not hang");
+  // A death before "ready" costs two respawn credits, so a pool of 2 (budget
+  // workers*2 = 4) burns out in two 1500ms warm-up waves (~3s), not the four the
+  // old one-credit rule would have run (~6s). Bound it below three waves so the
+  // faster give-up is enforced, not just "did not hang".
+  const elapsed = Date.now() - t0;
+  assert.ok(elapsed < 4000, `fell back after two warm-up waves, not more (was ${elapsed}ms)`);
   assert.deepEqual(results, files.map((f) => extractOne(f, null)), "in-thread fallback produced the full result set");
 });
 
